@@ -1,6 +1,8 @@
 """Offline bilingual heuristic email analysis; not a production security filter."""
 import re
 import unicodedata
+import ipaddress
+from urllib.parse import urlsplit, unquote
 
 RULES = {"password": 25, "urgent": 20, "verify": 20, "account": 10,
          "gift card": 25, "click here": 15}
@@ -23,7 +25,7 @@ for weight, phrases in GROUPS.values():
 def normalize(text):
     return " ".join(unicodedata.normalize("NFKC", text).casefold().split())
 
-def analyze(email):
+def analyze_text(email):
     normalized = normalize(email)
     candidates = []
     for phrase, weight in RULES.items():
@@ -38,5 +40,56 @@ def analyze(email):
     score = min(100, sum(RULES[p] for p in matches))
     return {"score": score, "risk": "high" if score >= 60 else "medium" if score >= 25 else "low", "matches": matches}
 
+
+URL_PATTERN = re.compile(r'https?://[^\s<>"\x27]+', re.I)
+SHORTENERS = {"bit.ly", "tinyurl.com", "t.co", "is.gd", "ow.ly", "buff.ly"}
+
+def analyze_url(url):
+    indicators = {}
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+        if not host or parts.scheme.lower() not in {"http", "https"}:
+            raise ValueError("Invalid HTTP(S) URL")
+        _ = parts.port
+    except ValueError:
+        return {"url": url, "status": "invalid", "score": 0, "indicators": {}}
+    if parts.scheme.lower() == "http":
+        indicators["unencrypted_http"] = 15
+    try:
+        ipaddress.ip_address(host)
+        indicators["ip_literal"] = 25
+    except ValueError:
+        pass
+    if len(url) > 150:
+        indicators["long_url"] = 10
+    if host.lower().rstrip(".") in SHORTENERS:
+        indicators["shortener"] = 15
+    if any(label.startswith("xn--") for label in host.lower().split(".")):
+        indicators["punycode"] = 20
+    if parts.username is not None or parts.password is not None:
+        indicators["userinfo"] = 25
+    path = unquote(parts.path)
+    if re.search(r"login|verify|password", path + "?" + unquote(parts.query), re.I):
+        indicators["sensitive_terms"] = 10
+    if re.search(r"\.(exe|scr|bat|msi|cmd|ps1)$", path, re.I):
+        indicators["executable_extension"] = 30
+    return {"url": url, "status": "reputation_unknown",
+            "score": min(100, sum(indicators.values())), "indicators": indicators}
+
+def analyze(email):
+    urls = list(dict.fromkeys(m.group().rstrip(".,;!?)]}") for m in URL_PATTERN.finditer(email)))
+    text_result = analyze_text(URL_PATTERN.sub(" ", email))
+    results = [analyze_url(url) for url in urls]
+    url_score = max((item["score"] for item in results), default=0)
+    score = min(100, text_result["score"] + url_score)
+    return {"score": score, "risk": "high" if score >= 60 else "medium" if score >= 25 else "low",
+            "matches": text_result["matches"], "text_score": text_result["score"],
+            "url_score": url_score, "urls": results}
+
 if __name__ == "__main__":
-    print(analyze(input("Paste a sample email: ")))
+    import sys
+    import json
+    if sys.stdin.isatty():
+        print("Paste email content, then press Ctrl-D on macOS/Linux (Ctrl-Z then Enter on Windows).", file=sys.stderr)
+    print(json.dumps(analyze(sys.stdin.read()), indent=2, ensure_ascii=False))
